@@ -46,6 +46,8 @@ import (
 	"github.com/open-policy-agent/opa/topdown/lineage"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // AuthenticationScheme enumerates the supported authentication schemes. The
@@ -692,9 +694,9 @@ func (s *Server) initRouters() {
 
 func (s *Server) instrumentHandler(handler func(http.ResponseWriter, *http.Request), label string) http.Handler {
 	if s.metrics != nil {
-		return s.metrics.InstrumentHandler(http.HandlerFunc(handler), label)
+		return s.metrics.InstrumentHandler(otelhttp.NewHandler(http.HandlerFunc(handler), label), label)
 	}
-	return http.HandlerFunc(handler)
+	return otelhttp.NewHandler(http.HandlerFunc(handler), label)
 }
 
 func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisions, txn storage.Transaction, decisionID string, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (results types.QueryResponseV1, err error) {

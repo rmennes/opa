@@ -2368,14 +2368,14 @@ func TestCertSelectionLogic(t *testing.T) {
 	}
 
 	getClientTLSConfig := func(obj ast.Object) *tls.Config {
-		_, client, err := createHTTPRequest(BuiltinContext{Context: context.Background()}, obj)
+		_, _, transport, err := createHTTPRequest(BuiltinContext{Context: context.Background()}, obj)
 		if err != nil {
 			t.Fatalf("Unexpected error creating HTTP request %v", err)
 		}
-		if client.Transport == nil {
+		if transport == nil {
 			return nil
 		}
-		return client.Transport.(*http.Transport).TLSClientConfig
+		return transport.TLSClientConfig
 	}
 
 	systemCertsPool, err := x509.SystemCertPool()

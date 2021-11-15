@@ -27,6 +27,8 @@ import (
 	"github.com/open-policy-agent/opa/topdown/builtins"
 	"github.com/open-policy-agent/opa/topdown/cache"
 	"github.com/open-policy-agent/opa/util"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type cachingMode string
@@ -261,7 +263,7 @@ func useSocket(rawURL string, tlsConfig *tls.Config) (bool, string, *http.Transp
 	return true, rawURL, tr
 }
 
-func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *http.Client, error) {
+func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *http.Client, *http.Transport, error) {
 	var url string
 	var method string
 
@@ -294,7 +296,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	for _, val := range obj.Keys() {
 		key, err := ast.JSON(val.Value)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		key = key.(string)
@@ -319,7 +321,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 				"tls_client_key_file",
 				"tls_client_key_env_variable",
 				"tls_server_name":
-				return nil, nil, fmt.Errorf("%q must be a string", key)
+				return nil, nil, nil, fmt.Errorf("%q must be a string", key)
 			}
 		}
 
@@ -331,18 +333,18 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 		case "enable_redirect":
 			enableRedirect, err = strconv.ParseBool(obj.Get(val).String())
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		case "body":
 			bodyVal := obj.Get(val).Value
 			bodyValInterface, err := ast.JSON(bodyVal)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 
 			bodyValBytes, err := json.Marshal(bodyValInterface)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			body = bytes.NewBuffer(bodyValBytes)
 		case "raw_body":
@@ -350,7 +352,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 		case "tls_use_system_certs":
 			tempTLSUseSystemCerts, err := strconv.ParseBool(obj.Get(val).String())
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			tlsUseSystemCerts = &tempTLSUseSystemCerts
 		case "tls_ca_cert":
@@ -377,26 +379,26 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 			headersVal := obj.Get(val).Value
 			headersValInterface, err := ast.JSON(headersVal)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			var ok bool
 			customHeaders, ok = headersValInterface.(map[string]interface{})
 			if !ok {
-				return nil, nil, fmt.Errorf("invalid type for headers key")
+				return nil, nil, nil, fmt.Errorf("invalid type for headers key")
 			}
 		case "tls_insecure_skip_verify":
 			tlsInsecureSkipVerify, err = strconv.ParseBool(obj.Get(val).String())
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		case "timeout":
 			timeout, err = parseTimeout(obj.Get(val).Value)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		case "cache", "force_cache", "force_cache_duration_seconds", "force_json_decode", "raise_error", "caching_mode": // no-op
 		default:
-			return nil, nil, fmt.Errorf("invalid parameter %q", key)
+			return nil, nil, nil, fmt.Errorf("invalid parameter %q", key)
 		}
 	}
 
@@ -413,7 +415,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	if len(tlsClientCert) > 0 && len(tlsClientKey) > 0 {
 		cert, err := tls.X509KeyPair(tlsClientCert, tlsClientKey)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
@@ -423,7 +425,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	if tlsClientCertFile != "" && tlsClientKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(tlsClientCertFile, tlsClientKeyFile)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
@@ -435,7 +437,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 			[]byte(os.Getenv(tlsClientCertEnvVar)),
 			[]byte(os.Getenv(tlsClientKeyEnvVar)))
 		if err != nil {
-			return nil, nil, fmt.Errorf("cannot extract public/private key pair from envvars %q, %q: %w",
+			return nil, nil, nil, fmt.Errorf("cannot extract public/private key pair from envvars %q, %q: %w",
 				tlsClientCertEnvVar, tlsClientKeyEnvVar, err)
 		}
 
@@ -455,7 +457,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	if tlsUseSystemCerts != nil && *tlsUseSystemCerts && runtime.GOOS != "windows" {
 		pool, err := x509.SystemCertPool()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
@@ -466,7 +468,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 		tlsCaCert = bytes.Replace(tlsCaCert, []byte("\\n"), []byte("\n"), -1)
 		pool, err := addCACertsFromBytes(tlsConfig.RootCAs, []byte(tlsCaCert))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
@@ -476,7 +478,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	if tlsCaCertFile != "" {
 		pool, err := addCACertsFromFile(tlsConfig.RootCAs, tlsCaCertFile)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
@@ -486,28 +488,32 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	if tlsCaCertEnvVar != "" {
 		pool, err := addCACertsFromEnv(tlsConfig.RootCAs, tlsCaCertEnvVar)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		isTLS = true
 		tlsConfig.RootCAs = pool
 	}
 
+	var transport *http.Transport
+
 	if isTLS {
 		if ok, parsedURL, tr := useSocket(url, &tlsConfig); ok {
-			client.Transport = tr
+			transport = tr
 			url = parsedURL
 		} else {
 			tr := http.DefaultTransport.(*http.Transport).Clone()
 			tr.TLSClientConfig = &tlsConfig
-			client.Transport = tr
+			transport = tr
 		}
 	} else {
 		if ok, parsedURL, tr := useSocket(url, nil); ok {
-			client.Transport = tr
+			transport = tr
 			url = parsedURL
 		}
 	}
+
+	client.Transport = otelhttp.NewTransport(transport)
 
 	// check if redirects are enabled
 	if !enableRedirect {
@@ -526,7 +532,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 	// the request is cancelled if evaluation is cancelled.
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	req = req.WithContext(bctx.Context)
@@ -538,7 +544,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 		for k, v := range customHeaders {
 			header, ok := v.(string)
 			if !ok {
-				return nil, nil, fmt.Errorf("invalid type for headers value %q", v)
+				return nil, nil, nil, fmt.Errorf("invalid type for headers value %q", v)
 			}
 
 			req.Header.Add(k, header)
@@ -569,7 +575,7 @@ func createHTTPRequest(bctx BuiltinContext, obj ast.Object) (*http.Request, *htt
 		tlsConfig.ServerName = tlsServerName
 	}
 
-	return req, client, nil
+	return req, client, transport, nil
 }
 
 func executeHTTPRequest(req *http.Request, client *http.Client) (*http.Response, error) {
@@ -1188,7 +1194,7 @@ func newInterQueryCache(bctx BuiltinContext, key ast.Object, forceCacheParams *f
 func (c *interQueryCache) CheckCache() (ast.Value, error) {
 	var err error
 
-	c.httpReq, c.httpClient, err = createHTTPRequest(c.bctx, c.key)
+	c.httpReq, c.httpClient, _, err = createHTTPRequest(c.bctx, c.key)
 	if err != nil {
 		return nil, handleHTTPSendErr(c.bctx, err)
 	}
@@ -1260,7 +1266,7 @@ func (c *intraQueryCache) InsertIntoCache(value *http.Response) (ast.Value, erro
 
 // ExecuteHTTPRequest executes a HTTP request
 func (c *intraQueryCache) ExecuteHTTPRequest() (*http.Response, error) {
-	httpReq, httpClient, err := createHTTPRequest(c.bctx, c.key)
+	httpReq, httpClient, _, err := createHTTPRequest(c.bctx, c.key)
 	if err != nil {
 		return nil, handleHTTPSendErr(c.bctx, err)
 	}

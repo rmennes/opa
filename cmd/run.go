@@ -18,6 +18,14 @@ import (
 	"github.com/open-policy-agent/opa/runtime"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/util"
+
+	"google.golang.org/grpc"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
 )
 
 const (
@@ -44,6 +52,7 @@ type runCmdParams struct {
 	pubKeyID           string
 	skipBundleVerify   bool
 	excludeVerifyFiles []string
+	otelEndpoint       string
 }
 
 func newRunParams() runCmdParams {
@@ -160,6 +169,7 @@ To skip bundle verification, use the --skip-verify flag.
 				fmt.Println("error:", err)
 				os.Exit(1)
 			}
+
 			startRuntime(ctx, rt, cmdParams.serverMode)
 		},
 	}
@@ -190,6 +200,7 @@ To skip bundle verification, use the --skip-verify flag.
 	addBundleModeFlag(runCommand.Flags(), &cmdParams.rt.BundleMode, false)
 	runCommand.Flags().BoolVar(&cmdParams.skipVersionCheck, "skip-version-check", false, "disables anonymous version reporting (see: https://openpolicyagent.org/docs/latest/privacy)")
 	addIgnoreFlag(runCommand.Flags(), &cmdParams.ignore)
+	runCommand.Flags().StringVarP(&cmdParams.otelEndpoint, "otel-endpoint", "", "", "set otel endpoint")
 
 	// bundle verification config
 	addVerificationKeyFlag(runCommand.Flags(), &cmdParams.pubKey)
@@ -275,7 +286,41 @@ func initRuntime(ctx context.Context, params runCmdParams, args []string) (*runt
 		return nil, err
 	}
 
+	if params.otelEndpoint != "" {
+		if _, err := initTracer(ctx, params.otelEndpoint); err != nil {
+			return nil, err
+		}
+	}
+
 	return rt, nil
+}
+
+func initTracer(ctx context.Context, otelEndpoint string) (*otlptrace.Exporter, error) {
+	otlpOptions := []otlptracegrpc.Option{
+		otlptracegrpc.WithInsecure(),
+		otlptracegrpc.WithEndpoint(otelEndpoint),
+		otlptracegrpc.WithDialOption(grpc.WithBlock()),
+	}
+
+	client := otlptracegrpc.NewClient(otlpOptions...)
+
+	otlpTraceExporter, err := otlptrace.New(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+
+	batchSpanProcessor := trace.NewBatchSpanProcessor(otlpTraceExporter)
+
+	tracerProvider := trace.NewTracerProvider(
+		trace.WithSpanProcessor(batchSpanProcessor),
+		//trace.WithSampler(sdktrace.AlwaysSample()), - please check TracerProvider.WithSampler() implementation for details.
+	)
+
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
+
+	return otlpTraceExporter, nil
 }
 
 func startRuntime(ctx context.Context, rt *runtime.Runtime, serverMode bool) {
